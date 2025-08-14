@@ -1,0 +1,182 @@
+from AlgorithmImports import *
+
+class RegimeSPYIWithUpWindow(QCAlgorithm):
+
+    def Initialize(self):
+        # ----- Backtest params -----
+        self.SetStartDate(2023, 1, 1)
+        self.SetEndDate(2024, 1, 1)
+        self.SetCash(100000)
+        self.SetBenchmark("SPY")
+
+        # ----- Controls / knobs -----
+        self.SMA_LEN = 30
+        self.CONFIRM_DAYS = 5          # closes above/below SMA required to confirm regime
+        self.REBALANCE_MINUTE = 10     # minutes after market open
+        self.LEVERAGE_CAP = 2.00       # absolute cap on total target weight
+
+        # 1) When SPY < SMA (confirmed): downtrend/hedged mix
+        self.DOWN_WEIGHTS = {
+            "SPYI": 1.00,
+            "SPY" : 0.00,
+            "SSO" : 0.00,
+            "SH"  : 0.15
+        }
+
+        # 2) On cross back UP: use this mix for X trading days ("uncapped-upside mix")
+        self.UP_MIX_DAYS = 20  # <---- set your X here (trading days)
+        self.UP_WEIGHTS_MIX = {
+            "SPYI": 0.75,
+            "SPY" : 0.30,
+            "SSO" : 0.20,
+            "SH"  : 0.00
+        }
+
+        # 3) After UP window ends (and still above SMA): hold 1.5x SPYI only
+        self.SPYI_ONLY_LEVER = 1.50
+
+        # ----- Assets -----
+        self.spy  = self.AddEquity("SPY",  Resolution.Daily).Symbol
+        self.spyi = self.AddEquity("SPYI", Resolution.Daily).Symbol  # may be unavailable pre-2022
+        self.sso  = self.AddEquity("SSO",  Resolution.Daily).Symbol  # 2x SPY
+        self.sh   = self.AddEquity("SH",   Resolution.Daily).Symbol  # -1x SPY
+
+        # ----- Indicators -----
+        self.sma = self.SMA(self.spy, self.SMA_LEN, Resolution.Daily)
+        self.RegisterIndicator(self.spy, self.sma, Resolution.Daily)
+        self.spy_closes = RollingWindow[float](self.CONFIRM_DAYS)
+
+        # Warmup
+        self.SetWarmup(self.SMA_LEN + self.CONFIRM_DAYS, Resolution.Daily)
+
+        # State
+        self.last_uptrend = None           # bool or None (unknown)
+        self.up_mix_bars_left = 0          # trading days left in the UP window
+        self.prev_targets = None           # remember last applied targets to avoid redundant orders
+        self.eps = 1e-4                    # tiny compare guard (not a drift rule)
+
+        # Schedule daily rebalance
+        self.Schedule.On(
+            self.DateRules.EveryDay(self.spy),
+            self.TimeRules.AfterMarketOpen(self.spy, self.REBALANCE_MINUTE),
+            self.RebalanceIfNeeded
+        )
+
+        # Plots
+        self.PlotIndicator("SPY_SMA50", self.sma)
+        self.Debug("Initialized.")
+
+    def OnData(self, data: Slice):
+        # Track closes for confirmation
+        if data.ContainsKey(self.spy) and data[self.spy] and data[self.spy].Close > 0:
+            self.spy_closes.Add(float(data[self.spy].Close))
+
+        # Optional plotting once ready
+        if not self.IsWarmingUp and self.sma.IsReady and self.spy_closes.Count == self.CONFIRM_DAYS:
+            regime = 1 if self._is_uptrend_confirmed() else -1
+            self.Plot("Regime", "UP(1)/DOWN(-1)", regime)
+            self.Plot("SPY_Price", "Close", self.Securities[self.spy].Price)
+            self.Plot("SPY_Price", "SMA50", float(self.sma.Current.Value))
+
+    # ===== Core scheduled rebalance =====
+
+    def RebalanceIfNeeded(self):
+        if self.IsWarmingUp or not self.sma.IsReady or self.spy_closes.Count < self.CONFIRM_DAYS:
+            return
+
+        uptrend_now = self._is_uptrend_confirmed()
+
+        # Detect confirmed regime cross
+        if self.last_uptrend is not None:
+            # Crossed from DOWN -> UP: start the UP mix window
+            if self.last_uptrend is False and uptrend_now is True:
+                self.up_mix_bars_left = self.UP_MIX_DAYS
+                self.Debug(f"Confirmed cross UP @ {self.Time.date()}. Start UP window: {self.up_mix_bars_left} bars.")
+
+            # Crossed from UP -> DOWN: cancel any UP window
+            if self.last_uptrend is True and uptrend_now is False:
+                if self.up_mix_bars_left > 0:
+                    self.Debug(f"Confirmed cross DOWN @ {self.Time.date()}. Cancel remaining UP window.")
+                self.up_mix_bars_left = 0
+
+        self.last_uptrend = uptrend_now
+
+        # Determine target weights by regime + UP window
+        if uptrend_now:
+            if self.up_mix_bars_left > 0:
+                weights = dict(self.UP_WEIGHTS_MIX)
+            else:
+                # SPYI-only lever after window
+                weights = {"SPYI": self.SPYI_ONLY_LEVER, "SPY": 0.0, "SSO": 0.0, "SH": 0.0}
+        else:
+            weights = dict(self.DOWN_WEIGHTS)
+
+        # Handle SPYI data unavailability
+        if not self.Securities[self.spyi].HasData:
+            w_spyi = weights.get("SPYI", 0.0)
+            if w_spyi > 0:
+                self.Debug(f"SPYI unavailable on {self.Time.date()}. Shifting {w_spyi:.2f} to SPY.")
+                weights["SPY"] = weights.get("SPY", 0.0) + w_spyi
+                weights["SPYI"] = 0.0
+
+        # Leverage cap
+        total = sum(max(0.0, w) for w in weights.values())
+        if total > self.LEVERAGE_CAP:
+            scale = self.LEVERAGE_CAP / total
+            for k in weights:
+                weights[k] *= scale
+            self.Debug(f"Scaled targets by {scale:.3f} to respect LEVERAGE_CAP={self.LEVERAGE_CAP:.2f}.")
+
+        # Always rebalance when targets change (no drift threshold)
+        if self._targets_changed(weights):
+            self.Debug(f"Rebalance @ {self.Time} | uptrend={uptrend_now} window_left={self.up_mix_bars_left} | targets={weights}")
+            self._apply_targets(weights)
+            self.prev_targets = dict(weights)  # remember
+
+        # Decrement UP window after today’s rebalance if applicable
+        if uptrend_now and self.up_mix_bars_left > 0:
+            self.up_mix_bars_left -= 1
+
+    # ===== Helpers =====
+
+    def _is_uptrend_confirmed(self) -> bool:
+        if self.spy_closes.Count < self.CONFIRM_DAYS or not self.sma.IsReady:
+            return False
+        sma = float(self.sma.Current.Value)
+        # Strict confirmation: all last N closes > SMA => UP, all < SMA => DOWN, else keep previous
+        all_above = all(c > sma for c in self.spy_closes)
+        all_below = all(c < sma for c in self.spy_closes)
+        if all_above:
+            return True
+        if all_below:
+            return False
+        # Ambiguous: keep prior regime if known; else default to False
+        return self.last_uptrend if self.last_uptrend is not None else False
+
+    def _targets_changed(self, new_targets: dict) -> bool:
+        """Return True if targets differ meaningfully from last applied (no drift logic, just change-detection)."""
+        if self.prev_targets is None:
+            return True
+        keys = set(new_targets.keys()) | set(self.prev_targets.keys())
+        for k in keys:
+            if abs(new_targets.get(k, 0.0) - self.prev_targets.get(k, 0.0)) > self.eps:
+                return True
+        return False
+
+    def _apply_targets(self, weights: dict):
+        desired = {
+            self.spyi: weights.get("SPYI", 0.0),
+            self.spy : weights.get("SPY",  0.0),
+            self.sso : weights.get("SSO",  0.0),
+            self.sh  : weights.get("SH",   0.0),
+        }
+        for sym, w in desired.items():
+            if self.Securities[sym].HasData:
+                self.SetHoldings(sym, w)
+
+        # Clean up anything not in desired
+        desired_syms = set(desired.keys())
+        for kvp in self.Portfolio:
+            sym = kvp.Key
+            if self.Portfolio[sym].Invested and sym not in desired_syms:
+                self.Liquidate(sym, tag="Not in target set")
