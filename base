@@ -44,16 +44,26 @@ class RegimeSPYIWithUpWindow(QCAlgorithm):
         # ----- Indicators -----
         self.sma = self.SMA(self.spy, self.SMA_LEN, Resolution.Daily)
         self.RegisterIndicator(self.spy, self.sma, Resolution.Daily)
-        self.spy_closes = RollingWindow[float](self.CONFIRM_DAYS)
 
-        # Warmup
-        self.SetWarmup(self.SMA_LEN + self.CONFIRM_DAYS, Resolution.Daily)
+        # Warmup (indicator only)
+        self.SetWarmup(self.SMA_LEN, Resolution.Daily)
 
         # State
+        self.spy_closes = RollingWindow[float](self.CONFIRM_DAYS)
         self.last_uptrend = None           # bool or None (unknown)
-        self.up_mix_bars_left = 0          # trading days left in the UP window
-        self.prev_targets = None           # remember last applied targets to avoid redundant orders
-        self.eps = 1e-4                    # tiny compare guard (not a drift rule)
+        self.up_mix_bars_left = 0          # how many trading days left in the UP window
+        self.prev_targets = None           # last applied target mix
+        self.eps = 1e-4                    # tiny equality guard
+
+        # Seed the confirmation window so you can act on day 1 if conditions already met
+        hist = self.History(self.spy, self.CONFIRM_DAYS, Resolution.Daily)
+        if not hist.empty:
+            try:
+                closes = list(hist.close.tail(self.CONFIRM_DAYS))
+            except Exception:
+                closes = [bar.Close for bar in hist]
+            for c in closes:
+                self.spy_closes.Add(float(c))
 
         # Schedule daily rebalance
         self.Schedule.On(
@@ -63,7 +73,7 @@ class RegimeSPYIWithUpWindow(QCAlgorithm):
         )
 
         # Plots
-        self.PlotIndicator("SPY_SMA50", self.sma)
+        self.PlotIndicator("SPY_SMA", self.sma)
         self.Debug("Initialized.")
 
     def OnData(self, data: Slice):
@@ -71,12 +81,11 @@ class RegimeSPYIWithUpWindow(QCAlgorithm):
         if data.ContainsKey(self.spy) and data[self.spy] and data[self.spy].Close > 0:
             self.spy_closes.Add(float(data[self.spy].Close))
 
-        # Optional plotting once ready
         if not self.IsWarmingUp and self.sma.IsReady and self.spy_closes.Count == self.CONFIRM_DAYS:
             regime = 1 if self._is_uptrend_confirmed() else -1
             self.Plot("Regime", "UP(1)/DOWN(-1)", regime)
             self.Plot("SPY_Price", "Close", self.Securities[self.spy].Price)
-            self.Plot("SPY_Price", "SMA50", float(self.sma.Current.Value))
+            self.Plot("SPY_Price", "SMA", float(self.sma.Current.Value))
 
     # ===== Core scheduled rebalance =====
 
@@ -86,14 +95,11 @@ class RegimeSPYIWithUpWindow(QCAlgorithm):
 
         uptrend_now = self._is_uptrend_confirmed()
 
-        # Detect confirmed regime cross
+        # Detect confirmed regime cross and manage the UP window
         if self.last_uptrend is not None:
-            # Crossed from DOWN -> UP: start the UP mix window
             if self.last_uptrend is False and uptrend_now is True:
                 self.up_mix_bars_left = self.UP_MIX_DAYS
                 self.Debug(f"Confirmed cross UP @ {self.Time.date()}. Start UP window: {self.up_mix_bars_left} bars.")
-
-            # Crossed from UP -> DOWN: cancel any UP window
             if self.last_uptrend is True and uptrend_now is False:
                 if self.up_mix_bars_left > 0:
                     self.Debug(f"Confirmed cross DOWN @ {self.Time.date()}. Cancel remaining UP window.")
@@ -106,7 +112,6 @@ class RegimeSPYIWithUpWindow(QCAlgorithm):
             if self.up_mix_bars_left > 0:
                 weights = dict(self.UP_WEIGHTS_MIX)
             else:
-                # SPYI-only lever after window
                 weights = {"SPYI": self.SPYI_ONLY_LEVER, "SPY": 0.0, "SSO": 0.0, "SH": 0.0}
         else:
             weights = dict(self.DOWN_WEIGHTS)
@@ -127,11 +132,11 @@ class RegimeSPYIWithUpWindow(QCAlgorithm):
                 weights[k] *= scale
             self.Debug(f"Scaled targets by {scale:.3f} to respect LEVERAGE_CAP={self.LEVERAGE_CAP:.2f}.")
 
-        # Always rebalance when targets change (no drift threshold)
+        # Rebalance when targets changed
         if self._targets_changed(weights):
             self.Debug(f"Rebalance @ {self.Time} | uptrend={uptrend_now} window_left={self.up_mix_bars_left} | targets={weights}")
-            self._apply_targets(weights)
-            self.prev_targets = dict(weights)  # remember
+            self._apply_targets_sell_first(weights)   # <<< sell-first version
+            self.prev_targets = dict(weights)
 
         # Decrement UP window after today’s rebalance if applicable
         if uptrend_now and self.up_mix_bars_left > 0:
@@ -143,7 +148,6 @@ class RegimeSPYIWithUpWindow(QCAlgorithm):
         if self.spy_closes.Count < self.CONFIRM_DAYS or not self.sma.IsReady:
             return False
         sma = float(self.sma.Current.Value)
-        # Strict confirmation: all last N closes > SMA => UP, all < SMA => DOWN, else keep previous
         all_above = all(c > sma for c in self.spy_closes)
         all_below = all(c < sma for c in self.spy_closes)
         if all_above:
@@ -154,7 +158,6 @@ class RegimeSPYIWithUpWindow(QCAlgorithm):
         return self.last_uptrend if self.last_uptrend is not None else False
 
     def _targets_changed(self, new_targets: dict) -> bool:
-        """Return True if targets differ meaningfully from last applied (no drift logic, just change-detection)."""
         if self.prev_targets is None:
             return True
         keys = set(new_targets.keys()) | set(self.prev_targets.keys())
@@ -163,18 +166,36 @@ class RegimeSPYIWithUpWindow(QCAlgorithm):
                 return True
         return False
 
-    def _apply_targets(self, weights: dict):
+    def _apply_targets_sell_first(self, weights: dict):
+        """Sell legs that are above target first to free margin, then buy legs below target."""
         desired = {
             self.spyi: weights.get("SPYI", 0.0),
             self.spy : weights.get("SPY",  0.0),
             self.sso : weights.get("SSO",  0.0),
             self.sh  : weights.get("SH",   0.0),
         }
-        for sym, w in desired.items():
-            if self.Securities[sym].HasData:
-                self.SetHoldings(sym, w)
 
-        # Clean up anything not in desired
+        pv = float(self.Portfolio.TotalPortfolioValue) or 1.0
+
+        # 1) SELL FIRST: reduce any position whose current weight > target
+        for sym, tw in desired.items():
+            sec = self.Securities[sym]
+            if not sec.HasData or sec.Price <= 0:
+                continue
+            cur_w = (self.Portfolio[sym].HoldingsValue / pv)
+            if cur_w > tw + self.eps:
+                self.SetHoldings(sym, tw)
+
+        # 2) BUY AFTER: increase any position whose current weight < target
+        for sym, tw in desired.items():
+            sec = self.Securities[sym]
+            if not sec.HasData or sec.Price <= 0:
+                continue
+            cur_w = (self.Portfolio[sym].HoldingsValue / pv)
+            if cur_w + self.eps < tw:
+                self.SetHoldings(sym, tw)
+
+        # 3) Clean up anything not in desired
         desired_syms = set(desired.keys())
         for kvp in self.Portfolio:
             sym = kvp.Key
