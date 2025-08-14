@@ -4,14 +4,14 @@ class RegimeSPYIWithUpWindow(QCAlgorithm):
 
     def Initialize(self):
         # ----- Backtest params -----
-        self.SetStartDate(2023, 1, 1)
-        self.SetEndDate(2024, 1, 1)
+        self.SetStartDate(2024, 1, 1)
+        self.SetEndDate(2025, 1, 1)
         self.SetCash(100000)
         self.SetBenchmark("SPY")
 
         # ----- Controls / knobs -----
         self.SMA_LEN = 30
-        self.CONFIRM_DAYS = 5          # closes above/below SMA required to confirm regime
+        self.CONFIRM_DAYS = 10          # closes above/below SMA required to confirm regime
         self.REBALANCE_MINUTE = 10     # minutes after market open
         self.LEVERAGE_CAP = 2.00       # absolute cap on total target weight
 
@@ -19,21 +19,21 @@ class RegimeSPYIWithUpWindow(QCAlgorithm):
         self.DOWN_WEIGHTS = {
             "SPYI": 1.00,
             "SPY" : 0.00,
-            "SSO" : 0.00,
-            "SH"  : 0.15
+            "SSO" : 0.25,
+            "SH"  : 0.00
         }
 
         # 2) On cross back UP: use this mix for X trading days ("uncapped-upside mix")
         self.UP_MIX_DAYS = 20  # <---- set your X here (trading days)
         self.UP_WEIGHTS_MIX = {
             "SPYI": 0.75,
-            "SPY" : 0.30,
-            "SSO" : 0.20,
+            "SPY" : 0.20,
+            "SSO" : 0.30,
             "SH"  : 0.00
         }
 
         # 3) After UP window ends (and still above SMA): hold 1.5x SPYI only
-        self.SPYI_ONLY_LEVER = 1.50
+        self.SPYI_ONLY_LEVER = 1.5
 
         # ----- Assets -----
         self.spy  = self.AddEquity("SPY",  Resolution.Daily).Symbol
