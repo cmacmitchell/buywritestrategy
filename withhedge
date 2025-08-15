@@ -1,0 +1,272 @@
+from AlgorithmImports import *
+
+class RegimeSPYIWithUpWindow(QCAlgorithm):
+
+    def Initialize(self):
+        # ----- Backtest params -----
+        self.SetStartDate(2022, 9, 1)
+        self.SetEndDate(2025, 8, 1)
+        self.SetCash(100000)
+        self.SetBenchmark("SPY")
+
+        # ----- Controls / knobs -----
+        self.SMA30_LEN = 30                       # primary regime SMA (with 10-bar confirmation)
+        self.SMA50_LEN = 50                       # override SMA (no confirmation)
+        self.CONFIRM_DAYS = 10                    # closes above/below SMA30 to confirm regime
+        self.REBALANCE_MINUTE = 10                # minutes after market open
+        self.LEVERAGE_CAP = 2.00                  # absolute cap on total target weight
+
+        # 1) When SPY < 30 SMA (confirmed): downtrend/hedged mix (as provided)
+        self.DOWN_WEIGHTS = {
+            "SPYI": 1.00,
+            "SPY" : 0.00,
+            "SSO" : 0.25,
+            "SH"  : 0.00
+        }
+
+        # 2) On cross back UP: use this mix for X trading days ("uncapped-upside mix")
+        self.UP_MIX_DAYS = 20
+        self.UP_WEIGHTS_MIX = {
+            "SPYI": 0.75,
+            "SPY" : 0.20,
+            "SSO" : 0.30,
+            "SH"  : 0.00
+        }
+
+        # 3) After UP window ends (and still above SMA30): hold 2.0x SPYI only
+        self.SPYI_ONLY_LEVER = 2.0
+
+        # 50-SMA override regime (hedge with SH when price is below 50-SMA)
+        self.HEDGE_WEIGHTS = {
+            "SPYI": 0.50,
+            "SPY" : 0.00,
+            "SSO" : 0.00,
+            "SH"  : 0.50
+        }
+
+        # ----- Assets -----
+        self.spy  = self.AddEquity("SPY",  Resolution.Daily).Symbol
+        self.spyi = self.AddEquity("SPYI", Resolution.Daily).Symbol
+        self.sso  = self.AddEquity("SSO",  Resolution.Daily).Symbol
+        self.sh   = self.AddEquity("SH",   Resolution.Daily).Symbol
+
+        # ----- Indicators -----
+        self.sma30 = self.SMA(self.spy, self.SMA30_LEN, Resolution.Daily)
+        self.sma50 = self.SMA(self.spy, self.SMA50_LEN, Resolution.Daily)
+        self.RegisterIndicator(self.spy, self.sma30, Resolution.Daily)
+        self.RegisterIndicator(self.spy, self.sma50, Resolution.Daily)
+
+        # Warmup (indicators only)
+        self.SetWarmup(max(self.SMA30_LEN, self.SMA50_LEN), Resolution.Daily)
+
+        # State
+        self.spy_closes = RollingWindow[float](self.CONFIRM_DAYS)
+        self.last_uptrend = None                 # bool or None (30-SMA confirm state)
+        self.up_mix_bars_left = 0
+        self.prev_targets = None
+        self.eps = 1e-4
+
+        # Track 50-SMA cross state
+        self.prev_above_50 = None                # last known "price >= SMA50" boolean
+
+        # Seed confirmation window so you can act on day 1 if already met
+        hist = self.History(self.spy, self.CONFIRM_DAYS, Resolution.Daily)
+        if not hist.empty:
+            try:
+                closes = list(hist.close.tail(self.CONFIRM_DAYS))
+            except Exception:
+                closes = [bar.Close for bar in hist]
+            for c in closes:
+                self.spy_closes.Add(float(c))
+
+        # --- Performance tracking (optional; kept from your previous version) ---
+        self.start_pv = None
+        self.start_spy_price = None
+        self.last_spy_price = None
+        self.start_for_index = None  # first PV for index
+
+        # Schedule daily rebalance
+        self.Schedule.On(
+            self.DateRules.EveryDay(self.spy),
+            self.TimeRules.AfterMarketOpen(self.spy, self.REBALANCE_MINUTE),
+            self.RebalanceIfNeeded
+        )
+
+        # Plots
+        self.PlotIndicator("SPY_SMA30", self.sma30)
+        self.PlotIndicator("SPY_SMA50", self.sma50)
+        self.Debug("Initialized with 50-SMA override logic.")
+
+    def OnData(self, data: Slice):
+        # Track closes for confirmation
+        if data.ContainsKey(self.spy) and data[self.spy] and data[self.spy].Close > 0:
+            px = float(data[self.spy].Close)
+            self.spy_closes.Add(px)
+            self.last_spy_price = px
+
+        # Take initial snapshots AFTER warmup completes
+        if (self.start_pv is None and not self.IsWarmingUp
+            and self.sma30.IsReady and self.sma50.IsReady and self.last_spy_price is not None):
+            self.start_pv = float(self.Portfolio.TotalPortfolioValue)
+            self.start_spy_price = float(self.last_spy_price)
+            self.start_for_index = self.start_pv
+            self.prev_above_50 = self._price_above_sma50()  # initialize cross state
+            self.Debug(f"Perf baseline set @ {self.Time.date()}: start_pv={self.start_pv:.2f}, "
+                       f"start_spy={self.start_spy_price:.4f}")
+
+        # Plot regime and price when ready
+        if not self.IsWarmingUp and self.sma30.IsReady and self.spy_closes.Count == self.CONFIRM_DAYS:
+            regime = 1 if self._is_uptrend_confirmed() else -1
+            self.Plot("Regime", "UP(1)/DOWN(-1)", regime)
+            self.Plot("SPY_Price", "Close", self.Securities[self.spy].Price)
+            self.Plot("SPY_Price", "SMA30", float(self.sma30.Current.Value))
+            self.Plot("SPY_Price", "SMA50", float(self.sma50.Current.Value))
+
+        # Update simple indexed chart (strategy vs SPY), once baseline set
+        if self.start_for_index is not None and self.start_spy_price is not None and self.last_spy_price is not None:
+            cur_pv = float(self.Portfolio.TotalPortfolioValue)
+            strat_ret = (cur_pv / self.start_for_index) if self.start_for_index > 0 else 1.0
+            spy_ret = (self.last_spy_price / self.start_spy_price) if self.start_spy_price > 0 else 1.0
+            self.Plot("Indexed", "Strategy", 100.0 * strat_ret)
+            self.Plot("Indexed", "SPY", 100.0 * spy_ret)
+
+    # ===== Core scheduled rebalance =====
+
+    def RebalanceIfNeeded(self):
+        if self.IsWarmingUp or not (self.sma30.IsReady and self.sma50.IsReady) or self.spy_closes.Count < self.CONFIRM_DAYS:
+            return
+
+        price = float(self.Securities[self.spy].Price)
+        above50 = self._price_above_sma50()
+
+        # Detect 50-SMA crosses and act immediately
+        if self.prev_above_50 is not None:
+            # Cross DOWN: below 50-SMA => override into hedge regime immediately
+            if self.prev_above_50 and not above50:
+                self.Debug(f"50SMA CROSS DOWN @ {self.Time.date()} -> Activate SH hedge override.")
+            # Cross UP: back above 50-SMA => start UP window immediately
+            if not self.prev_above_50 and above50:
+                self.up_mix_bars_left = self.UP_MIX_DAYS
+                self.Debug(f"50SMA CROSS UP @ {self.Time.date()} -> Start UP window: {self.up_mix_bars_left} bars.")
+
+        self.prev_above_50 = above50
+
+        # --- Determine target weights with 50-SMA override ---
+        if not above50:
+            # BELOW 50-SMA => force hedge regime regardless of 30-SMA confirmation/window
+            weights = dict(self.HEDGE_WEIGHTS)
+        else:
+            # ABOVE 50-SMA => normal 30-SMA regime logic
+            uptrend_now = self._is_uptrend_confirmed()
+
+            # Update last_uptrend for plotting/reference
+            self.last_uptrend = uptrend_now if self.last_uptrend is None else uptrend_now
+
+            if uptrend_now:
+                if self.up_mix_bars_left > 0:
+                    weights = dict(self.UP_WEIGHTS_MIX)
+                else:
+                    weights = {"SPYI": self.SPYI_ONLY_LEVER, "SPY": 0.0, "SSO": 0.0, "SH": 0.0}
+            else:
+                weights = dict(self.DOWN_WEIGHTS)
+
+        # Handle SPYI data unavailability
+        if not self.Securities[self.spyi].HasData:
+            w_spyi = weights.get("SPYI", 0.0)
+            if w_spyi > 0:
+                self.Debug(f"SPYI unavailable on {self.Time.date()}. Shifting {w_spyi:.2f} to SPY.")
+                weights["SPY"] = weights.get("SPY", 0.0) + w_spyi
+                weights["SPYI"] = 0.0
+
+        # Leverage cap
+        total = sum(max(0.0, w) for w in weights.values())
+        if total > self.LEVERAGE_CAP:
+            scale = self.LEVERAGE_CAP / total
+            for k in weights:
+                weights[k] *= scale
+            self.Debug(f"Scaled targets by {scale:.3f} to respect LEVERAGE_CAP={self.LEVERAGE_CAP:.2f}.")
+
+        # Rebalance when targets changed
+        if self._targets_changed(weights):
+            self.Debug(f"Rebalance @ {self.Time} | above50={above50} window_left={self.up_mix_bars_left} | targets={weights}")
+            self._apply_targets_sell_first(weights)   # sell-first execution
+            self.prev_targets = dict(weights)
+
+        # Decrement UP window after today’s rebalance if applicable
+        if above50 and self.up_mix_bars_left > 0:
+            self.up_mix_bars_left -= 1
+
+    # ===== Helpers =====
+
+    def _is_uptrend_confirmed(self) -> bool:
+        """30-SMA confirmation: True if last N closes > SMA30, False if last N < SMA30, else keep prior."""
+        if self.spy_closes.Count < self.CONFIRM_DAYS or not self.sma30.IsReady:
+            return False
+        sma = float(self.sma30.Current.Value)
+        all_above = all(c > sma for c in self.spy_closes)
+        all_below = all(c < sma for c in self.spy_closes)
+        if all_above: return True
+        if all_below: return False
+        return self.last_uptrend if self.last_uptrend is not None else False
+
+    def _price_above_sma50(self) -> bool:
+        return float(self.Securities[self.spy].Price) >= float(self.sma50.Current.Value)
+
+    def _targets_changed(self, new_targets: dict) -> bool:
+        if self.prev_targets is None:
+            return True
+        keys = set(new_targets.keys()) | set(self.prev_targets.keys())
+        for k in keys:
+            if abs(new_targets.get(k, 0.0) - self.prev_targets.get(k, 0.0)) > self.eps:
+                return True
+        return False
+
+    def _apply_targets_sell_first(self, weights: dict):
+        """Sell legs that are above target first to free margin, then buy legs below target."""
+        desired = {
+            self.spyi: weights.get("SPYI", 0.0),
+            self.spy : weights.get("SPY",  0.0),
+            self.sso : weights.get("SSO",  0.0),
+            self.sh  : weights.get("SH",   0.0),
+        }
+
+        pv = float(self.Portfolio.TotalPortfolioValue) or 1.0
+
+        # 1) SELL FIRST
+        for sym, tw in desired.items():
+            sec = self.Securities[sym]
+            if not sec.HasData or sec.Price <= 0:
+                continue
+            cur_w = (self.Portfolio[sym].HoldingsValue / pv)
+            if cur_w > tw + self.eps:
+                self.SetHoldings(sym, tw)
+
+        # 2) BUY AFTER
+        for sym, tw in desired.items():
+            sec = self.Securities[sym]
+            if not sec.HasData or sec.Price <= 0:
+                continue
+            cur_w = (self.Portfolio[sym].HoldingsValue / pv)
+            if cur_w + self.eps < tw:
+                self.SetHoldings(sym, tw)
+
+        # 3) Clean up strays
+        desired_syms = set(desired.keys())
+        for kvp in self.Portfolio:
+            sym = kvp.Key
+            if self.Portfolio[sym].Invested and sym not in desired_syms:
+                self.Liquidate(sym, tag="Not in target set")
+
+    # ===== Final summary (optional) =====
+
+    def OnEndOfAlgorithm(self):
+        if self.start_pv is None or self.start_spy_price is None or self.last_spy_price is None:
+            self.Debug("Not enough data to compute final performance snapshot.")
+            return
+        end_pv = float(self.Portfolio.TotalPortfolioValue)
+        strat_ret = (end_pv / self.start_pv) - 1.0
+        spy_ret = (self.last_spy_price / self.start_spy_price) - 1.0
+        self.Debug(f"Final PV: {end_pv:.2f} | Start PV: {self.start_pv:.2f}")
+        self.Debug(f"Strategy Return: {strat_ret*100:.2f}% | SPY Return: {spy_ret*100:.2f}%")
+        self.Plot("Summary", "Strategy %", strat_ret * 100.0)
+        self.Plot("Summary", "SPY %", spy_ret * 100.0)
