@@ -4,16 +4,16 @@ class RegimeSPYIWithUpWindow(QCAlgorithm):
 
     def Initialize(self):
         # ----- Backtest params -----
-        self.SetStartDate(2024, 1, 1)
-        self.SetEndDate(2025, 1, 1)
+        self.SetStartDate(2023, 8, 1)
+        self.SetEndDate(2023, 10, 27)
         self.SetCash(100000)
         self.SetBenchmark("SPY")
 
         # ----- Controls / knobs -----
         self.SMA_LEN = 30
         self.CONFIRM_DAYS = 10          # closes above/below SMA required to confirm regime
-        self.REBALANCE_MINUTE = 10     # minutes after market open
-        self.LEVERAGE_CAP = 2.00       # absolute cap on total target weight
+        self.REBALANCE_MINUTE = 10      # minutes after market open
+        self.LEVERAGE_CAP = 2.00        # absolute cap on total target weight
 
         # 1) When SPY < SMA (confirmed): downtrend/hedged mix
         self.DOWN_WEIGHTS = {
@@ -32,14 +32,14 @@ class RegimeSPYIWithUpWindow(QCAlgorithm):
             "SH"  : 0.00
         }
 
-        # 3) After UP window ends (and still above SMA): hold 1.5x SPYI only
-        self.SPYI_ONLY_LEVER = 1.5
+        # 3) After UP window ends (and still above SMA): hold 2.0x SPYI only
+        self.SPYI_ONLY_LEVER = 2.0
 
         # ----- Assets -----
         self.spy  = self.AddEquity("SPY",  Resolution.Daily).Symbol
-        self.spyi = self.AddEquity("SPYI", Resolution.Daily).Symbol  # may be unavailable pre-2022
-        self.sso  = self.AddEquity("SSO",  Resolution.Daily).Symbol  # 2x SPY
-        self.sh   = self.AddEquity("SH",   Resolution.Daily).Symbol  # -1x SPY
+        self.spyi = self.AddEquity("SPYI", Resolution.Daily).Symbol
+        self.sso  = self.AddEquity("SSO",  Resolution.Daily).Symbol
+        self.sh   = self.AddEquity("SH",   Resolution.Daily).Symbol
 
         # ----- Indicators -----
         self.sma = self.SMA(self.spy, self.SMA_LEN, Resolution.Daily)
@@ -50,12 +50,12 @@ class RegimeSPYIWithUpWindow(QCAlgorithm):
 
         # State
         self.spy_closes = RollingWindow[float](self.CONFIRM_DAYS)
-        self.last_uptrend = None           # bool or None (unknown)
-        self.up_mix_bars_left = 0          # how many trading days left in the UP window
-        self.prev_targets = None           # last applied target mix
-        self.eps = 1e-4                    # tiny equality guard
+        self.last_uptrend = None
+        self.up_mix_bars_left = 0
+        self.prev_targets = None
+        self.eps = 1e-4
 
-        # Seed the confirmation window so you can act on day 1 if conditions already met
+        # Seed confirmation window so you can act on day 1 if already met
         hist = self.History(self.spy, self.CONFIRM_DAYS, Resolution.Daily)
         if not hist.empty:
             try:
@@ -64,6 +64,16 @@ class RegimeSPYIWithUpWindow(QCAlgorithm):
                 closes = [bar.Close for bar in hist]
             for c in closes:
                 self.spy_closes.Add(float(c))
+
+        # --- Performance tracking ---
+        self.start_pv = None
+        self.start_spy_price = None
+        self.last_spy_price = None
+
+        # Plot: index both to 100
+        self.strategy_index = 100.0
+        self.spy_index = 100.0
+        self.start_for_index = None  # first PV for index
 
         # Schedule daily rebalance
         self.Schedule.On(
@@ -79,13 +89,34 @@ class RegimeSPYIWithUpWindow(QCAlgorithm):
     def OnData(self, data: Slice):
         # Track closes for confirmation
         if data.ContainsKey(self.spy) and data[self.spy] and data[self.spy].Close > 0:
-            self.spy_closes.Add(float(data[self.spy].Close))
+            px = float(data[self.spy].Close)
+            self.spy_closes.Add(px)
+            self.last_spy_price = px
 
+        # Take initial snapshots AFTER warmup completes
+        if (self.start_pv is None and not self.IsWarmingUp and
+            self.sma.IsReady and self.last_spy_price is not None):
+            self.start_pv = float(self.Portfolio.TotalPortfolioValue)
+            self.start_spy_price = float(self.last_spy_price)
+            self.start_for_index = self.start_pv
+            self.Debug(f"Perf baseline set @ {self.Time.date()}: start_pv={self.start_pv:.2f}, "
+                       f"start_spy={self.start_spy_price:.4f}")
+
+        # Plot regime and price when ready
         if not self.IsWarmingUp and self.sma.IsReady and self.spy_closes.Count == self.CONFIRM_DAYS:
             regime = 1 if self._is_uptrend_confirmed() else -1
             self.Plot("Regime", "UP(1)/DOWN(-1)", regime)
             self.Plot("SPY_Price", "Close", self.Securities[self.spy].Price)
             self.Plot("SPY_Price", "SMA", float(self.sma.Current.Value))
+
+        # Update simple indexed chart (strategy vs SPY), once baseline set
+        if self.start_for_index is not None and self.start_spy_price is not None and self.last_spy_price is not None:
+            cur_pv = float(self.Portfolio.TotalPortfolioValue)
+            strat_ret = (cur_pv / self.start_for_index) if self.start_for_index > 0 else 1.0
+            spy_ret = (self.last_spy_price / self.start_spy_price) if self.start_spy_price > 0 else 1.0
+            # Index to 100
+            self.Plot("Indexed", "Strategy", 100.0 * strat_ret)
+            self.Plot("Indexed", "SPY", 100.0 * spy_ret)
 
     # ===== Core scheduled rebalance =====
 
@@ -135,7 +166,7 @@ class RegimeSPYIWithUpWindow(QCAlgorithm):
         # Rebalance when targets changed
         if self._targets_changed(weights):
             self.Debug(f"Rebalance @ {self.Time} | uptrend={uptrend_now} window_left={self.up_mix_bars_left} | targets={weights}")
-            self._apply_targets_sell_first(weights)   # <<< sell-first version
+            self._apply_targets_sell_first(weights)   # sell-first version
             self.prev_targets = dict(weights)
 
         # Decrement UP window after today’s rebalance if applicable
@@ -201,3 +232,21 @@ class RegimeSPYIWithUpWindow(QCAlgorithm):
             sym = kvp.Key
             if self.Portfolio[sym].Invested and sym not in desired_syms:
                 self.Liquidate(sym, tag="Not in target set")
+
+    # ===== Final summary =====
+
+    def OnEndOfAlgorithm(self):
+        if self.start_pv is None or self.start_spy_price is None or self.last_spy_price is None:
+            self.Debug("Not enough data to compute final performance snapshot.")
+            return
+
+        end_pv = float(self.Portfolio.TotalPortfolioValue)
+        strat_ret = (end_pv / self.start_pv) - 1.0
+        spy_ret = (self.last_spy_price / self.start_spy_price) - 1.0
+
+        self.Debug(f"Final PV: {end_pv:.2f} | Start PV: {self.start_pv:.2f}")
+        self.Debug(f"Strategy Return: {strat_ret*100:.2f}% | SPY Return: {spy_ret*100:.2f}%")
+
+        # Also log to Results window as a custom chart point
+        self.Plot("Summary", "Strategy %", strat_ret * 100.0)
+        self.Plot("Summary", "SPY %", spy_ret * 100.0)
