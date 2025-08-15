@@ -38,10 +38,10 @@ class RegimeSPYIWithUpWindow(QCAlgorithm):
 
         # 50-SMA override regime (hedge with SH when price is below 50-SMA)
         self.HEDGE_WEIGHTS = {
-            "SPYI": 0.50,
+            "SPYI": 0.60,
             "SPY" : 0.00,
             "SSO" : 0.00,
-            "SH"  : 0.50
+            "SH"  : 0.40
         }
 
         # ----- Assets -----
