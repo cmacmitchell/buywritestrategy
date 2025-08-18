@@ -20,7 +20,7 @@ class RegimeSPYIWithUpWindow(QCAlgorithm):
         self.DOWN_WEIGHTS = {
             "SPYI": 1.00,
             "SPY" : 0.00,
-            "SSO" : 0.25,
+            "SPUU" : 0.25,
             "SH"  : 0.00
         }
 
@@ -29,7 +29,7 @@ class RegimeSPYIWithUpWindow(QCAlgorithm):
         self.UP_WEIGHTS_MIX = {
             "SPYI": 0.75,
             "SPY" : 0.20,
-            "SSO" : 0.30,
+            "SPUU" : 0.30,
             "SH"  : 0.00
         }
 
@@ -40,15 +40,24 @@ class RegimeSPYIWithUpWindow(QCAlgorithm):
         self.HEDGE_WEIGHTS = {
             "SPYI": 0.60,
             "SPY" : 0.00,
-            "SSO" : 0.00,
+            "SPUU" : 0.00,
             "SH"  : 0.40
         }
 
         # ----- Assets -----
         self.spy  = self.AddEquity("SPY",  Resolution.Daily).Symbol
         self.spyi = self.AddEquity("SPYI", Resolution.Daily).Symbol
-        self.sso  = self.AddEquity("SSO",  Resolution.Daily).Symbol
+        self.spuu  = self.AddEquity("SPUU",  Resolution.Daily).Symbol
         self.sh   = self.AddEquity("SH",   Resolution.Daily).Symbol
+
+        # >>> Comparator: add JPST (55%) and FTSL (45%) for price series (no trading)
+        self.jpst = self.AddEquity("JPST", Resolution.Daily).Symbol
+        self.ftsl = self.AddEquity("FTSL", Resolution.Daily).Symbol
+        self.comp_w_jpst = 0.55
+        self.comp_w_ftsl = 0.45
+        self.comp_base_jpst = None
+        self.comp_base_ftsl = None
+        # <<<
 
         # ----- Indicators -----
         self.sma30 = self.SMA(self.spy, self.SMA30_LEN, Resolution.Daily)
@@ -79,7 +88,7 @@ class RegimeSPYIWithUpWindow(QCAlgorithm):
             for c in closes:
                 self.spy_closes.Add(float(c))
 
-        # --- Performance tracking (optional; kept from your previous version) ---
+        # --- Performance tracking (kept) ---
         self.start_pv = None
         self.start_spy_price = None
         self.last_spy_price = None
@@ -111,6 +120,17 @@ class RegimeSPYIWithUpWindow(QCAlgorithm):
             self.start_spy_price = float(self.last_spy_price)
             self.start_for_index = self.start_pv
             self.prev_above_50 = self._price_above_sma50()  # initialize cross state
+
+            # >>> set comparator baselines (JPST/FTSL)
+            if self.Securities[self.jpst].HasData and self.Securities[self.ftsl].HasData:
+                p_j = float(self.Securities[self.jpst].Price)
+                p_f = float(self.Securities[self.ftsl].Price)
+                if p_j > 0 and p_f > 0:
+                    self.comp_base_jpst = p_j
+                    self.comp_base_ftsl = p_f
+                    self.Debug(f"55/45 baseline @ {self.Time.date()}: JPST={p_j:.4f} FTSL={p_f:.4f}")
+            # <<<
+
             self.Debug(f"Perf baseline set @ {self.Time.date()}: start_pv={self.start_pv:.2f}, "
                        f"start_spy={self.start_spy_price:.4f}")
 
@@ -122,13 +142,26 @@ class RegimeSPYIWithUpWindow(QCAlgorithm):
             self.Plot("SPY_Price", "SMA30", float(self.sma30.Current.Value))
             self.Plot("SPY_Price", "SMA50", float(self.sma50.Current.Value))
 
-        # Update simple indexed chart (strategy vs SPY), once baseline set
-        if self.start_for_index is not None and self.start_spy_price is not None and self.last_spy_price is not None:
+        # Update simple indexed chart (strategy vs SPY) + comparator
+        if (self.start_for_index is not None and self.start_spy_price is not None 
+            and self.last_spy_price is not None):
             cur_pv = float(self.Portfolio.TotalPortfolioValue)
             strat_ret = (cur_pv / self.start_for_index) if self.start_for_index > 0 else 1.0
             spy_ret = (self.last_spy_price / self.start_spy_price) if self.start_spy_price > 0 else 1.0
             self.Plot("Indexed", "Strategy", 100.0 * strat_ret)
             self.Plot("Indexed", "SPY", 100.0 * spy_ret)
+
+            # >>> comparator line (requires baselines set)
+            if self.comp_base_jpst is not None and self.comp_base_ftsl is not None:
+                pj = float(self.Securities[self.jpst].Price)
+                pf = float(self.Securities[self.ftsl].Price)
+                if pj > 0 and pf > 0:
+                    comp_ratio = (
+                        self.comp_w_jpst * (pj / self.comp_base_jpst) +
+                        self.comp_w_ftsl * (pf / self.comp_base_ftsl)
+                    )
+                    self.Plot("Indexed", "55/45 JPST+FTSL", 100.0 * comp_ratio)
+            # <<<
 
     # ===== Core scheduled rebalance =====
 
@@ -153,20 +186,16 @@ class RegimeSPYIWithUpWindow(QCAlgorithm):
 
         # --- Determine target weights with 50-SMA override ---
         if not above50:
-            # BELOW 50-SMA => force hedge regime regardless of 30-SMA confirmation/window
             weights = dict(self.HEDGE_WEIGHTS)
         else:
-            # ABOVE 50-SMA => normal 30-SMA regime logic
             uptrend_now = self._is_uptrend_confirmed()
-
-            # Update last_uptrend for plotting/reference
             self.last_uptrend = uptrend_now if self.last_uptrend is None else uptrend_now
 
             if uptrend_now:
                 if self.up_mix_bars_left > 0:
                     weights = dict(self.UP_WEIGHTS_MIX)
                 else:
-                    weights = {"SPYI": self.SPYI_ONLY_LEVER, "SPY": 0.0, "SSO": 0.0, "SH": 0.0}
+                    weights = {"SPYI": self.SPYI_ONLY_LEVER, "SPY": 0.0, "SPUU": 0.0, "SH": 0.0}
             else:
                 weights = dict(self.DOWN_WEIGHTS)
 
@@ -226,7 +255,7 @@ class RegimeSPYIWithUpWindow(QCAlgorithm):
         desired = {
             self.spyi: weights.get("SPYI", 0.0),
             self.spy : weights.get("SPY",  0.0),
-            self.sso : weights.get("SSO",  0.0),
+            self.spuu : weights.get("SPUU",  0.0),
             self.sh  : weights.get("SH",   0.0),
         }
 
@@ -257,16 +286,38 @@ class RegimeSPYIWithUpWindow(QCAlgorithm):
             if self.Portfolio[sym].Invested and sym not in desired_syms:
                 self.Liquidate(sym, tag="Not in target set")
 
-    # ===== Final summary (optional) =====
+    # ===== Final summary =====
 
     def OnEndOfAlgorithm(self):
         if self.start_pv is None or self.start_spy_price is None or self.last_spy_price is None:
             self.Debug("Not enough data to compute final performance snapshot.")
             return
+
         end_pv = float(self.Portfolio.TotalPortfolioValue)
         strat_ret = (end_pv / self.start_pv) - 1.0
         spy_ret = (self.last_spy_price / self.start_spy_price) - 1.0
+
+        # Comparator final return (if baselines set)
+        comp_ret = None
+        if self.comp_base_jpst is not None and self.comp_base_ftsl is not None:
+            pj = float(self.Securities[self.jpst].Price)
+            pf = float(self.Securities[self.ftsl].Price)
+            if pj > 0 and pf > 0:
+                comp_ratio = (
+                    self.comp_w_jpst * (pj / self.comp_base_jpst) +
+                    self.comp_w_ftsl * (pf / self.comp_base_ftsl)
+                )
+                comp_ret = comp_ratio - 1.0
+
         self.Debug(f"Final PV: {end_pv:.2f} | Start PV: {self.start_pv:.2f}")
         self.Debug(f"Strategy Return: {strat_ret*100:.2f}% | SPY Return: {spy_ret*100:.2f}%")
+
+        if comp_ret is not None:
+            self.Debug(f"55/45 JPST/FTSL Return: {comp_ret*100:.2f}%")
+            self.Debug(f"Alpha vs 55/45: {(strat_ret - comp_ret)*100:.2f} pp")
+
+        # Plots
         self.Plot("Summary", "Strategy %", strat_ret * 100.0)
         self.Plot("Summary", "SPY %", spy_ret * 100.0)
+        if comp_ret is not None:
+            self.Plot("Summary", "55/45 %", comp_ret * 100.0)
